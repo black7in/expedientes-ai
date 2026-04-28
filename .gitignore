@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Variables de entorno
+.env
+
+# Modelos NLP (pesados, no van al repo)
+models/
+*.bin
+*.pt
+*.safetensors
+
+# Uploads temporales
+uploads/
+temp/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
