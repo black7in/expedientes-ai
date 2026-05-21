@@ -2,12 +2,12 @@ import os
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
 from ..services.indexar_service import indexar_auto_supremo, indexar_ley_desde_pdf
@@ -16,9 +16,8 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
 @router.get("/rag-stats")
-def rag_stats(db: Session = Depends(get_db)):
-    """Estadísticas de los chunks indexados en las tres colecciones RAG."""
-    row = db.execute(text("""
+async def rag_stats(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(text("""
         SELECT
             (SELECT COUNT(*)              FROM leyes_chunks)            AS leyes_chunks,
             (SELECT COUNT(DISTINCT ley)   FROM leyes_chunks)            AS leyes_count,
@@ -26,22 +25,25 @@ def rag_stats(db: Session = Depends(get_db)):
             (SELECT COUNT(DISTINCT numero_auto) FROM jurisprudencia_chunks) AS autos_count,
             (SELECT COUNT(*)              FROM doc_chunks)              AS doc_chunks,
             (SELECT COUNT(DISTINCT documento_id) FROM doc_chunks)       AS docs_count
-    """)).fetchone()
+    """))
+    row = result.fetchone()
 
-    leyes = db.execute(text("""
+    leyes_result = await db.execute(text("""
         SELECT ley, materia, COUNT(*) AS chunks
         FROM leyes_chunks
         GROUP BY ley, materia
         ORDER BY ley
-    """)).fetchall()
+    """))
+    leyes = leyes_result.fetchall()
 
-    autos = db.execute(text("""
+    autos_result = await db.execute(text("""
         SELECT numero_auto, fecha_resolucion, materia, sala, COUNT(*) AS chunks
         FROM jurisprudencia_chunks
         GROUP BY numero_auto, fecha_resolucion, materia, sala
         ORDER BY fecha_resolucion DESC NULLS LAST
         LIMIT 50
-    """)).fetchall()
+    """))
+    autos = autos_result.fetchall()
 
     return {
         "stats": {
@@ -74,9 +76,8 @@ async def indexar_ley(
     archivo:    UploadFile = File(...),
     nombre_ley: str        = Form(...),
     materia:    str        = Form(...),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Indexa un PDF de ley boliviana artículo por artículo en leyes_chunks."""
     if not archivo.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="Solo se aceptan archivos PDF")
 
@@ -85,7 +86,7 @@ async def indexar_ley(
         tmp_path = tmp.name
 
     try:
-        chunks = indexar_ley_desde_pdf(tmp_path, nombre_ley, materia, db)
+        chunks = await indexar_ley_desde_pdf(tmp_path, nombre_ley, materia, db)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     finally:
@@ -103,12 +104,11 @@ class IndexarAutoRequest(BaseModel):
 
 
 @router.post("/indexar-jurisprudencia")
-def indexar_jurisprudencia(req: IndexarAutoRequest, db: Session = Depends(get_db)):
-    """Indexa un Auto Supremo del TSJ Bolivia en jurisprudencia_chunks."""
+async def indexar_jurisprudencia(req: IndexarAutoRequest, db: AsyncSession = Depends(get_db)):
     if len(req.texto.strip()) < 50:
         raise HTTPException(status_code=422, detail="El texto del Auto Supremo es demasiado corto")
 
-    chunks = indexar_auto_supremo(
+    chunks = await indexar_auto_supremo(
         numero_auto=req.numero_auto,
         fecha=req.fecha,
         materia=req.materia,
@@ -138,25 +138,29 @@ class PlantillaUpdateRequest(BaseModel):
 
 
 @router.get("/plantillas")
-def listar_plantillas(materia: Optional[str] = None, db: Session = Depends(get_db)):
-    """Lista todas las plantillas, opcionalmente filtradas por materia."""
-    query = """
-        SELECT id, nombre, tipo_documento, materia,
-               activo, es_default, created_at,
-               LENGTH(contenido) AS contenido_len
-        FROM plantillas_documentos
-        WHERE activo = true
-        {where}
-        ORDER BY materia, tipo_documento, created_at DESC
-    """
-    params = {}
+async def listar_plantillas(materia: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     if materia:
-        query = query.format(where="AND materia = :materia")
-        params["materia"] = materia
+        query = text("""
+            SELECT id, nombre, tipo_documento, materia,
+                   activo, es_default, created_at,
+                   LENGTH(contenido) AS contenido_len
+            FROM plantillas_documentos
+            WHERE activo = true AND materia = :materia
+            ORDER BY materia, tipo_documento, created_at DESC
+        """)
+        result = await db.execute(query, {"materia": materia})
     else:
-        query = query.format(where="")
+        query = text("""
+            SELECT id, nombre, tipo_documento, materia,
+                   activo, es_default, created_at,
+                   LENGTH(contenido) AS contenido_len
+            FROM plantillas_documentos
+            WHERE activo = true
+            ORDER BY materia, tipo_documento, created_at DESC
+        """)
+        result = await db.execute(query)
 
-    rows = db.execute(text(query), params).fetchall()
+    rows = result.fetchall()
     return [
         {
             "id":             str(r[0]),
@@ -173,16 +177,16 @@ def listar_plantillas(materia: Optional[str] = None, db: Session = Depends(get_d
 
 
 @router.get("/plantillas/{plantilla_id}")
-def obtener_plantilla(plantilla_id: str, db: Session = Depends(get_db)):
-    """Devuelve una plantilla completa incluyendo el contenido."""
-    row = db.execute(
+async def obtener_plantilla(plantilla_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
         text("""
             SELECT id, nombre, tipo_documento, materia, contenido, activo, es_default, created_at
             FROM plantillas_documentos
             WHERE id = CAST(:id AS uuid)
         """),
         {"id": plantilla_id},
-    ).fetchone()
+    )
+    row = result.fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Plantilla no encontrada")
@@ -200,15 +204,14 @@ def obtener_plantilla(plantilla_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/plantillas", status_code=201)
-def crear_plantilla(req: PlantillaRequest, db: Session = Depends(get_db)):
-    """Crea una nueva plantilla de documento."""
+async def crear_plantilla(req: PlantillaRequest, db: AsyncSession = Depends(get_db)):
     if not req.contenido.strip():
         raise HTTPException(status_code=422, detail="El contenido no puede estar vacío")
 
     new_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
 
-    db.execute(
+    await db.execute(
         text("""
             INSERT INTO plantillas_documentos
                 (id, nombre, tipo_documento, materia, contenido, activo, es_default, created_at, updated_at)
@@ -227,15 +230,14 @@ def crear_plantilla(req: PlantillaRequest, db: Session = Depends(get_db)):
             "now":        now,
         },
     )
-    db.commit()
+    await db.commit()
     return {"ok": True, "id": new_id}
 
 
 @router.put("/plantillas/{plantilla_id}")
-def actualizar_plantilla(
-    plantilla_id: str, req: PlantillaUpdateRequest, db: Session = Depends(get_db)
+async def actualizar_plantilla(
+    plantilla_id: str, req: PlantillaUpdateRequest, db: AsyncSession = Depends(get_db)
 ):
-    """Actualiza campos de una plantilla existente."""
     updates = {}
     if req.nombre is not None:
         updates["nombre"] = req.nombre
@@ -252,7 +254,7 @@ def actualizar_plantilla(
     set_clause = ", ".join(f"{k} = :{k}" for k in updates)
     updates["id"] = plantilla_id
 
-    db.execute(
+    await db.execute(
         text(f"""
             UPDATE plantillas_documentos
             SET {set_clause}, updated_at = NOW()
@@ -260,28 +262,24 @@ def actualizar_plantilla(
         """),
         updates,
     )
-    db.commit()
+    await db.commit()
     return {"ok": True}
 
 
 @router.post("/plantillas/{plantilla_id}/default")
-def set_plantilla_default(plantilla_id: str, db: Session = Depends(get_db)):
-    """
-    Marca esta plantilla como default para su materia+tipo_documento
-    y quita el flag a las demás del mismo par.
-    """
-    row = db.execute(
+async def set_plantilla_default(plantilla_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
         text("SELECT materia, tipo_documento FROM plantillas_documentos WHERE id = CAST(:id AS uuid)"),
         {"id": plantilla_id},
-    ).fetchone()
+    )
+    row = result.fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Plantilla no encontrada")
 
     materia, tipo = row[0], row[1]
 
-    # Quitar default a todas del mismo par
-    db.execute(
+    await db.execute(
         text("""
             UPDATE plantillas_documentos
             SET es_default = false, updated_at = NOW()
@@ -289,9 +287,7 @@ def set_plantilla_default(plantilla_id: str, db: Session = Depends(get_db)):
         """),
         {"materia": materia, "tipo": tipo},
     )
-
-    # Poner default a la seleccionada
-    db.execute(
+    await db.execute(
         text("""
             UPDATE plantillas_documentos
             SET es_default = true, updated_at = NOW()
@@ -299,14 +295,13 @@ def set_plantilla_default(plantilla_id: str, db: Session = Depends(get_db)):
         """),
         {"id": plantilla_id},
     )
-    db.commit()
+    await db.commit()
     return {"ok": True, "default_id": plantilla_id}
 
 
 @router.delete("/plantillas/{plantilla_id}")
-def eliminar_plantilla(plantilla_id: str, db: Session = Depends(get_db)):
-    """Desactiva (soft-delete) una plantilla."""
-    db.execute(
+async def eliminar_plantilla(plantilla_id: str, db: AsyncSession = Depends(get_db)):
+    await db.execute(
         text("""
             UPDATE plantillas_documentos
             SET activo = false, updated_at = NOW()
@@ -314,5 +309,5 @@ def eliminar_plantilla(plantilla_id: str, db: Session = Depends(get_db)):
         """),
         {"id": plantilla_id},
     )
-    db.commit()
+    await db.commit()
     return {"ok": True}

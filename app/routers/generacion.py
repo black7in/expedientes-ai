@@ -1,163 +1,403 @@
 import json
-import time
 import uuid
 from typing import Optional
 
-import anthropic
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import settings
 from ..database import get_db
-from ..prompts.system_prompt_civil import SYSTEM_PROMPT_CIVIL  # fallback
-from ..services.context_normalizer import (
-    normalizar_desde_expediente,
-    normalizar_desde_formulario,
-)
-from ..services.prompt_builder import construir_prompt_usuario
-from ..services.retrieval_service import recuperar_fragmentos
+from ..services.generator import generar_documento, regenerar_seccion
+from ..services.exporter import exportar_a_docx
 
-router = APIRouter(prefix="/api", tags=["generacion"])
+router = APIRouter(prefix="/api/generaciones", tags=["generacion"])
 
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
 
 class GenerarRequest(BaseModel):
-    tipo_documento: str
-    creado_por: str                          # UUID del usuario Laravel
-    instrucciones: Optional[str] = None
-    # Modo A — desde expediente existente
-    expediente_id: Optional[str] = None
-    # Modo B — formulario manual
-    demandante: Optional[str] = None
-    demandado: Optional[str] = None
-    juzgado: Optional[str] = None
-    ciudad: Optional[str] = "Santa Cruz de la Sierra"
-    tipo_proceso: Optional[str] = None
-    hechos: Optional[str] = None
+    usuario_id:     str
+    plantilla_id:   str
+    formato_salida: str = "estructurado"   # 'estructurado' | 'corrido'
+    expediente_id:  Optional[str] = None
+
+    # Datos del caso (formulario manual)
+    demandante:          Optional[str] = None
+    demandado:           Optional[str] = None
+    juzgado:             Optional[str] = None
+    ciudad:              str = "Santa Cruz de la Sierra"
+    tipo_proceso:        Optional[str] = None
+    subtipo:             Optional[str] = None
+    hechos:              Optional[str] = None
+    monto:               Optional[str] = None
+    instrucciones_extra: Optional[str] = None
 
 
-@router.post("/generar")
-def generar(req: GenerarRequest, db: Session = Depends(get_db)):
-    inicio = time.time()
+class RegenerarRequest(BaseModel):
+    feedback: Optional[str] = None
 
-    # 1. Construir contexto jurídico
-    if req.expediente_id:
-        try:
-            contexto = normalizar_desde_expediente(
-                req.expediente_id, req.tipo_documento, req.instrucciones, db
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-    else:
-        contexto = normalizar_desde_formulario({
-            "tipo_documento":    req.tipo_documento,
-            "demandante":        req.demandante or "",
-            "demandado":         req.demandado or "",
-            "juzgado":           req.juzgado or "",
-            "ciudad":            req.ciudad or "Santa Cruz de la Sierra",
-            "tipo_proceso":      req.tipo_proceso or "",
-            "hechos":            req.hechos or "",
-            "instrucciones_extra": req.instrucciones,
-        })
 
-    # 2. Recuperar fragmentos semánticos relevantes
-    query = f"{req.tipo_documento} {contexto.tipo_proceso} {contexto.hechos}"
-    fragmentos = recuperar_fragmentos(
-        query=query,
-        tipo_documento=req.tipo_documento,
-        materia=contexto.materia,
-        db=db,
-    )
+class EditarContenidoRequest(BaseModel):
+    contenido: str
 
-    # 3. Construir prompt de usuario
-    prompt_usuario = construir_prompt_usuario(contexto, fragmentos)
 
-    # 3b. Obtener system prompt desde DB (plantilla activa default para materia+tipo)
-    row = db.execute(
-        text("""
-            SELECT contenido FROM plantillas_documentos
-            WHERE materia = :materia
-              AND tipo_documento = :tipo
-              AND es_default = true
-              AND activo = true
-            ORDER BY created_at DESC
-            LIMIT 1
-        """),
-        {"materia": contexto.materia, "tipo": req.tipo_documento},
-    ).fetchone()
-    system_prompt = row.contenido if row else SYSTEM_PROMPT_CIVIL
+class EditarSeccionRequest(BaseModel):
+    contenido_editado: str
 
-    # 4. Llamar a Claude API
-    try:
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[{"role": "user", "content": prompt_usuario}],
-        )
-        borrador = response.content[0].text
-        tokens = response.usage.input_tokens + response.usage.output_tokens
-    except anthropic.AuthenticationError:
-        raise HTTPException(status_code=401, detail="ANTHROPIC_API_KEY inválida o no configurada")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Error al llamar a Claude: {str(e)}")
 
-    # 5. Persistir generación en la base de datos
-    tiempo_ms = int((time.time() - inicio) * 1000)
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("", status_code=201)
+async def crear_generacion(req: GenerarRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Crea una generación nueva y la procesa de forma batch (sección por sección).
+    Bloquea hasta que termina (~30-90s según cantidad de secciones).
+    """
+    # 1. Cargar plantilla
+    plantilla = await _cargar_plantilla(req.plantilla_id, db)
+
+    # 2. Validar input mínimo
+    _validar_input(req)
+
+    # 3. Preparar input_formulario
+    input_formulario = {
+        "demandante":          req.demandante or "",
+        "demandado":           req.demandado or "",
+        "juzgado":             req.juzgado or "",
+        "ciudad":              req.ciudad,
+        "tipo_proceso":        req.tipo_proceso or "",
+        "subtipo":             req.subtipo or plantilla.get("subtipo", ""),
+        "hechos":              req.hechos or "",
+        "monto":               req.monto or "",
+        "instrucciones_extra": req.instrucciones_extra or "",
+    }
+
+    # 4. Crear registro en estado 'generando'
     generacion_id = str(uuid.uuid4())
-
-    db.execute(
+    await db.execute(
         text("""
-            INSERT INTO generaciones (
-                id, expediente_id, creado_por, tipo_documento,
-                contexto_usado, chunks_usados, prompt_enviado,
-                borrador_generado, modelo_usado, tokens_usados,
-                tiempo_ms, created_at, updated_at
-            ) VALUES (
-                CAST(:id AS uuid),
-                CAST(:exp_id AS uuid),
-                CAST(:creado_por AS uuid),
-                :tipo_doc,
-                CAST(:contexto AS jsonb),
-                CAST(:chunks AS jsonb),
-                :prompt,
-                :borrador,
-                :modelo,
-                :tokens,
-                :tiempo_ms,
-                NOW(), NOW()
-            )
+            INSERT INTO generaciones
+                (id, usuario_id, expediente_id, tipo_documento, subtipo,
+                 plantilla_id, formato_salida, input_formulario, estado, llm_provider)
+            VALUES
+                (CAST(:id AS uuid), CAST(:uid AS uuid), CAST(:exp AS uuid),
+                 :tipo_doc, :subtipo,
+                 CAST(:plt_id AS uuid), :formato, CAST(:input AS jsonb),
+                 'generando', 'anthropic')
         """),
         {
-            "id":         generacion_id,
-            "exp_id":     req.expediente_id,
-            "creado_por": req.creado_por,
-            "tipo_doc":   req.tipo_documento,
-            "contexto":   json.dumps(contexto.to_dict(), ensure_ascii=False),
-            "chunks":     json.dumps({
-                "docs_estudio":  [c["tipo"]     for c in fragmentos.get("docs_estudio", [])],
-                "jurisprudencia":[c["auto"]     for c in fragmentos.get("jurisprudencia", [])],
-                "leyes":         [c["articulo"] for c in fragmentos.get("leyes", [])],
-            }),
-            "prompt":     prompt_usuario,
-            "borrador":   borrador,
-            "modelo":     "claude-sonnet-4-6",
-            "tokens":     tokens,
-            "tiempo_ms":  tiempo_ms,
+            "id":      generacion_id,
+            "uid":     req.usuario_id,
+            "exp":     req.expediente_id,
+            "tipo_doc": plantilla["tipo_documento"],
+            "subtipo":  plantilla["subtipo"],
+            "plt_id":  req.plantilla_id,
+            "formato": req.formato_salida,
+            "input":   json.dumps(input_formulario, ensure_ascii=False),
         },
     )
-    db.commit()
+    await db.commit()
+
+    # 5. Generar (bloquea hasta completar)
+    try:
+        resultado = await generar_documento(
+            generacion_id=generacion_id,
+            plantilla=plantilla,
+            input_formulario=input_formulario,
+            formato_salida=req.formato_salida,
+            db=db,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {
-        "generacion_id": generacion_id,
-        "borrador":       borrador,
-        "fragmentos_usados": {
-            "docs_estudio":  len(fragmentos.get("docs_estudio", [])),
-            "jurisprudencia":len(fragmentos.get("jurisprudencia", [])),
-            "leyes":         len(fragmentos.get("leyes", [])),
-        },
-        "tokens_usados": tokens,
-        "tiempo_ms":     tiempo_ms,
+        "generacion_id":  generacion_id,
+        "estado":         "completado",
+        "contenido":      resultado["contenido"],
+        "tokens_input":   resultado["tokens_input"],
+        "tokens_output":  resultado["tokens_output"],
+        "secciones":      resultado["secciones"],
     }
+
+
+@router.get("")
+async def listar_generaciones(usuario_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        text("""
+            SELECT id, tipo_documento, subtipo, formato_salida,
+                   estado, tokens_input, tokens_output, created_at
+            FROM generaciones
+            WHERE usuario_id = CAST(:uid AS uuid)
+            ORDER BY created_at DESC
+            LIMIT 50
+        """),
+        {"uid": usuario_id},
+    )
+    rows = result.fetchall()
+    return [
+        {
+            "id":             str(r[0]),
+            "tipo_documento": r[1],
+            "subtipo":        r[2],
+            "formato_salida": r[3],
+            "estado":         r[4],
+            "tokens_total":   (r[5] or 0) + (r[6] or 0),
+            "created_at":     str(r[7]),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/{generacion_id}")
+async def obtener_generacion(generacion_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        text("""
+            SELECT id, usuario_id, expediente_id, tipo_documento, subtipo,
+                   plantilla_id, formato_salida, input_formulario,
+                   estado, cancelada, contenido_actual,
+                   llm_model, tokens_input, tokens_output, created_at, updated_at
+            FROM generaciones
+            WHERE id = CAST(:id AS uuid)
+        """),
+        {"id": generacion_id},
+    )
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Generación no encontrada")
+
+    return {
+        "id":              str(row[0]),
+        "usuario_id":      str(row[1]),
+        "expediente_id":   str(row[2]) if row[2] else None,
+        "tipo_documento":  row[3],
+        "subtipo":         row[4],
+        "plantilla_id":    str(row[5]) if row[5] else None,
+        "formato_salida":  row[6],
+        "input_formulario": row[7],
+        "estado":          row[8],
+        "cancelada":       row[9],
+        "contenido_actual": row[10],
+        "llm_model":       row[11],
+        "tokens_input":    row[12],
+        "tokens_output":   row[13],
+        "created_at":      str(row[14]),
+        "updated_at":      str(row[15]),
+    }
+
+
+@router.get("/{generacion_id}/secciones")
+async def listar_secciones(generacion_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        text("""
+            SELECT id, seccion_id, orden,
+                   contenido_generado, contenido_editado,
+                   chunks_usados, tokens_input, tokens_output, regenerada_count
+            FROM generacion_secciones
+            WHERE generacion_id = CAST(:id AS uuid)
+            ORDER BY orden
+        """),
+        {"id": generacion_id},
+    )
+    rows = result.fetchall()
+    return [
+        {
+            "id":                 str(r[0]),
+            "seccion_id":         r[1],
+            "orden":              r[2],
+            "contenido_generado": r[3],
+            "contenido_editado":  r[4],
+            "chunks_usados":      r[5],
+            "tokens_input":       r[6],
+            "tokens_output":      r[7],
+            "regenerada_count":   r[8],
+        }
+        for r in rows
+    ]
+
+
+@router.post("/{generacion_id}/secciones/{seccion_id}/regenerar")
+async def regenerar(
+    generacion_id: str,
+    seccion_id: str,
+    req: RegenerarRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    gen = await _cargar_generacion_completa(generacion_id, db)
+    plantilla = await _cargar_plantilla(str(gen["plantilla_id"]), db)
+
+    try:
+        resultado = await regenerar_seccion(
+            generacion_id=generacion_id,
+            seccion_id=seccion_id,
+            plantilla=plantilla,
+            input_formulario=gen["input_formulario"],
+            formato_salida=gen["formato_salida"],
+            feedback=req.feedback,
+            db=db,
+        )
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return resultado
+
+
+@router.put("/{generacion_id}")
+async def actualizar_contenido(
+    generacion_id: str,
+    req: EditarContenidoRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Guarda edición manual del documento completo."""
+    await db.execute(
+        text("""
+            UPDATE generaciones SET
+                contenido_actual = :contenido,
+                estado           = 'editado',
+                updated_at       = NOW()
+            WHERE id = CAST(:id AS uuid)
+        """),
+        {"contenido": req.contenido, "id": generacion_id},
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.put("/{generacion_id}/secciones/{seccion_id}")
+async def editar_seccion(
+    generacion_id: str,
+    seccion_id: str,
+    req: EditarSeccionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Guarda edición manual de una sección específica."""
+    await db.execute(
+        text("""
+            UPDATE generacion_secciones SET
+                contenido_editado = :contenido,
+                updated_at        = NOW()
+            WHERE generacion_id = CAST(:gid AS uuid) AND seccion_id = :sid
+        """),
+        {"contenido": req.contenido_editado, "gid": generacion_id, "sid": seccion_id},
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/{generacion_id}/cancelar")
+async def cancelar(generacion_id: str, db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        text("""
+            UPDATE generaciones SET cancelada = TRUE, updated_at = NOW()
+            WHERE id = CAST(:id AS uuid)
+        """),
+        {"id": generacion_id},
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/{generacion_id}/descargar")
+async def descargar_docx(generacion_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        text("SELECT contenido_actual, tipo_documento, subtipo FROM generaciones WHERE id = CAST(:id AS uuid)"),
+        {"id": generacion_id},
+    )
+    row = result.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(status_code=404, detail="Generación sin contenido")
+
+    docx_bytes = exportar_a_docx(row[0])
+    nombre = f"{row[1]}_{row[2]}_{generacion_id[:8]}.docx"
+
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename={nombre}"},
+    )
+
+
+@router.delete("/{generacion_id}")
+async def eliminar(generacion_id: str, db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        text("DELETE FROM generaciones WHERE id = CAST(:id AS uuid)"),
+        {"id": generacion_id},
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+# ── Plantillas (consulta) ─────────────────────────────────────────────────────
+
+@router.get("/plantillas/listar")
+async def listar_plantillas(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        text("""
+            SELECT id, tipo_documento, subtipo, nombre, descripcion, version, activa
+            FROM plantillas
+            WHERE activa = TRUE
+            ORDER BY tipo_documento, subtipo
+        """)
+    )
+    rows = result.fetchall()
+    return [
+        {
+            "id":             str(r[0]),
+            "tipo_documento": r[1],
+            "subtipo":        r[2],
+            "nombre":         r[3],
+            "descripcion":    r[4],
+            "version":        r[5],
+            "activa":         r[6],
+        }
+        for r in rows
+    ]
+
+
+# ── Helpers privados ──────────────────────────────────────────────────────────
+
+async def _cargar_plantilla(plantilla_id: str, db: AsyncSession) -> dict:
+    result = await db.execute(
+        text("SELECT id, tipo_documento, subtipo, nombre, secciones FROM plantillas WHERE id = CAST(:id AS uuid)"),
+        {"id": plantilla_id},
+    )
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Plantilla no encontrada")
+    return {
+        "id":             str(row[0]),
+        "tipo_documento": row[1],
+        "subtipo":        row[2],
+        "nombre":         row[3],
+        "secciones":      row[4] if isinstance(row[4], list) else json.loads(row[4]),
+    }
+
+
+async def _cargar_generacion_completa(generacion_id: str, db: AsyncSession) -> dict:
+    result = await db.execute(
+        text("SELECT plantilla_id, formato_salida, input_formulario FROM generaciones WHERE id = CAST(:id AS uuid)"),
+        {"id": generacion_id},
+    )
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Generación no encontrada")
+    return {
+        "plantilla_id":    row[0],
+        "formato_salida":  row[1],
+        "input_formulario": row[2],
+    }
+
+
+def _validar_input(req: GenerarRequest) -> None:
+    errores = []
+    if not req.demandante or len(req.demandante.strip()) < 3:
+        errores.append("demandante: requerido (mínimo 3 caracteres)")
+    if not req.demandado or len(req.demandado.strip()) < 3:
+        errores.append("demandado: requerido (mínimo 3 caracteres)")
+    if not req.hechos or len(req.hechos.strip()) < 50:
+        errores.append("hechos: requerido (mínimo 50 caracteres)")
+    if req.formato_salida not in ("estructurado", "corrido"):
+        errores.append("formato_salida: debe ser 'estructurado' o 'corrido'")
+    if errores:
+        raise HTTPException(status_code=422, detail={"errores": errores})

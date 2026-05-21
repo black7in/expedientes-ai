@@ -14,5 +14,5 @@ app.include_router(admin.router)
 
 
 @app.get("/")
-def root():
-    return {"service": "expedientes-ai", "version": "0.2.0", "status": "running"}
+async def root():
+    return {"service": "expedientes-ai", "version": "0.3.0", "status": "running"}

@@ -1,35 +1,26 @@
-from sqlalchemy.orm import Session
+import asyncio
+
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from .embedding_service import EmbeddingService
 
 
-def recuperar_fragmentos(
+async def recuperar_fragmentos(
     query: str,
     tipo_documento: str,
     materia: str = "civil",
     top_k_docs: int = 4,
     top_k_jurisprudencia: int = 3,
     top_k_leyes: int = 5,
-    db: Session = None,
+    db: AsyncSession = None,
 ) -> dict:
-    """
-    Búsqueda semántica en las tres colecciones del RAG:
-      - doc_chunks        → estilo y fórmulas del estudio Rosales y Asociados
-      - jurisprudencia_chunks → Autos Supremos del TSJ Bolivia
-      - leyes_chunks      → artículos de códigos bolivianos
-
-    Retorna los fragmentos más relevantes de cada fuente para construir el prompt.
-    Si una colección está vacía (no indexada aún), devuelve lista vacía sin error.
-    """
-    query_emb = EmbeddingService.encode_query(query)
+    query_emb = await asyncio.to_thread(EmbeddingService.encode_query, query)
     emb_str = EmbeddingService.to_pgvector_str(query_emb)
 
-    # ── 1. Documentos del estudio (mismo tipo de documento) ──────────────────
-    docs_rows = db.execute(
+    docs_result = await db.execute(
         text("""
-            SELECT chunk_texto,
-                   tipo_doc,
+            SELECT chunk_texto, tipo_doc,
                    1 - (embedding <=> CAST(:emb AS vector)) AS similitud
             FROM doc_chunks
             WHERE tipo_doc = :tipo_doc
@@ -38,14 +29,12 @@ def recuperar_fragmentos(
             LIMIT :k
         """),
         {"emb": emb_str, "tipo_doc": tipo_documento, "k": top_k_docs},
-    ).fetchall()
+    )
+    docs_rows = docs_result.fetchall()
 
-    # ── 2. Jurisprudencia TSJ Bolivia ─────────────────────────────────────────
-    juris_rows = db.execute(
+    juris_result = await db.execute(
         text("""
-            SELECT chunk_texto,
-                   numero_auto,
-                   fecha_resolucion,
+            SELECT chunk_texto, numero_auto, fecha_resolucion,
                    1 - (embedding <=> CAST(:emb AS vector)) AS similitud
             FROM jurisprudencia_chunks
             WHERE materia = :materia
@@ -54,15 +43,12 @@ def recuperar_fragmentos(
             LIMIT :k
         """),
         {"emb": emb_str, "materia": materia, "k": top_k_jurisprudencia},
-    ).fetchall()
+    )
+    juris_rows = juris_result.fetchall()
 
-    # ── 3. Artículos de leyes bolivianas ─────────────────────────────────────
-    leyes_rows = db.execute(
+    leyes_result = await db.execute(
         text("""
-            SELECT chunk_texto,
-                   ley,
-                   numero_articulo,
-                   titulo_articulo,
+            SELECT chunk_texto, ley, numero_articulo, titulo_articulo,
                    1 - (embedding <=> CAST(:emb AS vector)) AS similitud
             FROM leyes_chunks
             WHERE materia = :materia
@@ -71,7 +57,8 @@ def recuperar_fragmentos(
             LIMIT :k
         """),
         {"emb": emb_str, "materia": materia, "k": top_k_leyes},
-    ).fetchall()
+    )
+    leyes_rows = leyes_result.fetchall()
 
     return {
         "docs_estudio": [

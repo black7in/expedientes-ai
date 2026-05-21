@@ -1,8 +1,10 @@
 import os
+import uuid as _uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
 from ..models import Documento
@@ -13,12 +15,11 @@ router = APIRouter(prefix="/api/documentos", tags=["documentos"])
 
 
 @router.post("/{documento_id}/extraer")
-def extraer_documento(documento_id: str, db: Session = Depends(get_db)):
-    """
-    Extrae el texto de un documento (PDF o DOCX) y actualiza la DB.
-    Llamado por Laravel tras subir un archivo.
-    """
-    doc = db.query(Documento).filter(Documento.id == documento_id).first()
+async def extraer_documento(documento_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Documento).where(Documento.id == _uuid.UUID(documento_id))
+    )
+    doc = result.scalar_one_or_none()
 
     if not doc:
         raise HTTPException(status_code=404, detail="Documento no encontrado")
@@ -40,8 +41,8 @@ def extraer_documento(documento_id: str, db: Session = Depends(get_db)):
         doc.texto_extraido = {"error": f"Error de extracción: {str(e)}"}
 
     doc.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(doc)
+    await db.commit()
+    await db.refresh(doc)
 
     return {
         "status": doc.estado_extraccion,
@@ -51,5 +52,5 @@ def extraer_documento(documento_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
