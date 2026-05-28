@@ -5,11 +5,21 @@ TIPOS_MEMORIAL = [
 ]
 
 TIPOS_ACCION = [
+    # Penal
     "estafa", "robo", "hurto", "lesiones", "homicidio", "violencia_familiar",
+    # Civil / Comercial
     "ejecucion_hipotecaria", "cobro_ejecutivo", "resolucion_contrato",
-    "reivindicatoria", "usucapion", "divorcio", "asistencia_familiar",
-    "filiacion", "despido_injustificado", "beneficios_sociales",
-    "amparo_constitucional", "accion_libertad", "accion_popular", "otro",
+    "cumplimiento_contrato", "nulidad_contrato", "daños_perjuicios",
+    "reivindicatoria", "usucapion", "desalojo", "interdicto",
+    "nulidad_escritura", "mejor_derecho_propiedad",
+    # Familiar
+    "divorcio", "asistencia_familiar", "filiacion", "guarda_custodia",
+    # Laboral
+    "despido_injustificado", "beneficios_sociales", "reincorporacion",
+    # Constitucional
+    "amparo_constitucional", "accion_libertad", "accion_popular",
+    "accion_cumplimiento",
+    "otro",
 ]
 
 MATERIAS = [

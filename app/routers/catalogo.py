@@ -13,7 +13,7 @@ _CAMPOS_VALIDOS = {"tipo_memorial", "tipo_accion"}
 
 
 class AprobarBody(BaseModel):
-    valor_oficial: Optional[str] = None  # si None, se usa el valor propuesto
+    valor_oficial: Optional[str] = None
     decidido_por: Optional[str] = "admin"
 
 
@@ -46,7 +46,7 @@ async def listar_propuestas(
 
 @router.post("/propuestas/{propuesta_id}/aprobar")
 async def aprobar_propuesta(
-    propuesta_id: int,
+    propuesta_id: str,
     body: AprobarBody,
     db: AsyncSession = Depends(get_db),
 ):
@@ -54,7 +54,7 @@ async def aprobar_propuesta(
         text("""
             SELECT id, campo, valor_propuesto, doc_ids
             FROM catalogo_propuestas
-            WHERE id = :id AND estado = 'pendiente'
+            WHERE id = CAST(:id AS uuid) AND estado = 'pendiente'
         """),
         {"id": propuesta_id},
     )
@@ -62,7 +62,7 @@ async def aprobar_propuesta(
     if not propuesta:
         raise HTTPException(status_code=404, detail="Propuesta no encontrada o ya fue decidida.")
 
-    _, campo, valor_propuesto, doc_ids = propuesta
+    prop_id, campo, valor_propuesto, doc_ids = propuesta
 
     if campo not in _CAMPOS_VALIDOS:
         raise HTTPException(status_code=500, detail=f"Campo inválido en BD: '{campo}'")
@@ -71,27 +71,24 @@ async def aprobar_propuesta(
     decidido_por = (body.decidido_por or "admin").strip()
     campo_propuesto = f"{campo}_propuesto"
 
-    # 1. Marcar la propuesta como aprobada
     await db.execute(
         text("""
             UPDATE catalogo_propuestas
             SET estado = 'aprobada',
                 fecha_decision = now(),
                 decidido_por = :decidido_por
-            WHERE id = :id
+            WHERE id = CAST(:id AS uuid)
         """),
         {"id": propuesta_id, "decidido_por": decidido_por},
     )
 
-    # 2. Actualizar los moldes asociados
-    # campo y campo_propuesto son valores del sistema (whitelist), no de usuario
+    # campo y campo_propuesto son de whitelist — no hay riesgo de inyección
     await db.execute(
         text(f"""
             UPDATE plantillas_memoriales
-            SET {campo}          = :valor_oficial,
-                {campo_propuesto} = NULL,
-                activo           = true
-            WHERE doc_id = ANY(:doc_ids)
+            SET {campo}           = :valor_oficial,
+                {campo_propuesto} = NULL
+            WHERE id = ANY(:doc_ids)
               AND {campo} = 'otro'
         """),
         {"valor_oficial": valor_oficial, "doc_ids": doc_ids},
@@ -104,13 +101,13 @@ async def aprobar_propuesta(
         "propuesta_id": propuesta_id,
         "campo": campo,
         "valor_aprobado": valor_oficial,
-        "moldes_activados": len(doc_ids),
+        "moldes_actualizados": len(doc_ids) if doc_ids else 0,
     }
 
 
 @router.post("/propuestas/{propuesta_id}/rechazar")
 async def rechazar_propuesta(
-    propuesta_id: int,
+    propuesta_id: str,
     body: RechazarBody,
     db: AsyncSession = Depends(get_db),
 ):
@@ -118,7 +115,7 @@ async def rechazar_propuesta(
         text("""
             SELECT id, campo, valor_propuesto, doc_ids
             FROM catalogo_propuestas
-            WHERE id = :id AND estado = 'pendiente'
+            WHERE id = CAST(:id AS uuid) AND estado = 'pendiente'
         """),
         {"id": propuesta_id},
     )
@@ -135,7 +132,7 @@ async def rechazar_propuesta(
             SET estado = 'rechazada',
                 fecha_decision = now(),
                 decidido_por = :decidido_por
-            WHERE id = :id
+            WHERE id = CAST(:id AS uuid)
         """),
         {"id": propuesta_id, "decidido_por": decidido_por},
     )
@@ -147,20 +144,19 @@ async def rechazar_propuesta(
         "propuesta_id": propuesta_id,
         "campo": campo,
         "valor_rechazado": valor_propuesto,
-        "moldes_en_cuarentena": len(doc_ids),
-        "nota": "Los moldes asociados permanecen inactivos. Reclasifícalos manualmente si corresponde.",
+        "moldes_en_cuarentena": len(doc_ids) if doc_ids else 0,
     }
 
 
 def _propuesta_to_dict(r) -> dict:
     return {
-        "id":               r[0],
-        "campo":            r[1],
-        "valor_propuesto":  r[2],
-        "frecuencia":       r[3],
-        "estado":           r[4],
-        "doc_ids":          r[5],
-        "fecha_creacion":   str(r[6]),
-        "fecha_decision":   str(r[7]) if r[7] else None,
-        "decidido_por":     r[8],
+        "id":              str(r[0]),
+        "campo":           r[1],
+        "valor_propuesto": r[2],
+        "frecuencia":      r[3],
+        "estado":          r[4],
+        "doc_ids":         [str(d) for d in r[5]] if r[5] else [],
+        "fecha_creacion":  str(r[6]),
+        "fecha_decision":  str(r[7]) if r[7] else None,
+        "decidido_por":    r[8],
     }

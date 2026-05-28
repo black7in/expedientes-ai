@@ -120,9 +120,9 @@ Si NO usas "otro", deja "tipo_accion_propuesto" como null.
 "instancia" — elegir UNO de: {ins}
 
 "formato" — elegir UNO de: {fmt}
-  "estructurado": secciones con títulos o numeración explícita
-  "corrido": prosa continua sin títulos
-  "mixto": combina ambos
+  "estructurado": secciones con títulos o numeración explícita en el CUERPO principal (ej: PRIMERO.-, SEGUNDO.-, I., II.)
+  "corrido": prosa continua sin títulos en el cuerpo; los "Otrosí" al pie NO cuentan como estructura
+  "mixto": combina ambos en el cuerpo del memorial
 
 "estilo" — elegir UNO de: {est}
 
@@ -203,11 +203,10 @@ async def _procesar_plantilla(html: str, origen: str, db: AsyncSession) -> dict:
     tipo_accion_prop   = llm_result.get("tipo_accion_propuesto")
     hay_propuesta      = llm_result["tipo_memorial"] == "otro" or llm_result["tipo_accion"] == "otro"
 
-    advertencias_criticas = {"anonimizacion_dudosa", "clasificacion_incierta", "contenido_sensible"}
+    advertencias_criticas = {"anonimizacion_dudosa", "contenido_sensible"}
     activo = (
         origen != "usuario_subido"
         and not advertencias_criticas.intersection(advertencias)
-        and not hay_propuesta
     )
 
     plantilla_id = str(uuid.uuid4())
@@ -327,10 +326,18 @@ def _validar_salida_llm(resultado: dict, texto_original: str) -> list[str]:
         if not resultado.get(campo):
             raise ValueError(f"El LLM no devolvió el campo obligatorio: '{campo}'")
 
-    if resultado["tipo_memorial"] not in TIPOS_MEMORIAL:
-        raise ValueError(f"tipo_memorial '{resultado['tipo_memorial']}' fuera de catálogo.")
-    if resultado["tipo_accion"] not in TIPOS_ACCION:
-        raise ValueError(f"tipo_accion '{resultado['tipo_accion']}' fuera de catálogo.")
+    for campo, catalogo in [("tipo_memorial", TIPOS_MEMORIAL), ("tipo_accion", TIPOS_ACCION)]:
+        valor = resultado.get(campo, "")
+        if valor not in catalogo:
+            prop_key = f"{campo}_propuesto"
+            if _PROPUESTA_RE.match(valor):
+                resultado[prop_key] = valor
+            else:
+                resultado[prop_key] = None
+            resultado[campo] = "otro"
+            if "clasificacion_incierta" not in advertencias:
+                advertencias.append("clasificacion_incierta")
+
     if resultado["materia"] not in MATERIAS:
         raise ValueError(f"materia '{resultado['materia']}' fuera de catálogo.")
     if resultado["instancia"] not in INSTANCIAS:
@@ -345,12 +352,10 @@ def _validar_salida_llm(resultado: dict, texto_original: str) -> list[str]:
         valor     = resultado.get(campo)
         propuesto = resultado.get(campo_prop)
         if valor == "otro":
-            if not propuesto:
-                raise ValueError(f"Cuando {campo}='otro', {campo_prop} no puede ser null.")
-            if not _PROPUESTA_RE.match(propuesto):
-                raise ValueError(
-                    f"{campo_prop} '{propuesto}' inválido: debe ser snake_case, máx 40 chars."
-                )
+            if propuesto and not _PROPUESTA_RE.match(propuesto):
+                resultado[campo_prop] = None
+            if not resultado.get(campo_prop) and "clasificacion_incierta" not in advertencias:
+                advertencias.append("clasificacion_incierta")
         else:
             resultado[campo_prop] = None
 

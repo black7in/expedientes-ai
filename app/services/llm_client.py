@@ -33,13 +33,27 @@ async def _completar_anthropic(
         kwargs["base_url"] = settings.llm_base_url
 
     client = anthropic.AsyncAnthropic(**kwargs)
-    msg = await client.messages.create(
-        model=settings.llm_model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-        temperature=temperature,
-    )
+
+    # Providers alternativos vía base_url (OpenCode, etc.) no siempre soportan
+    # el campo `system` como parámetro separado — se fusiona en el user message.
+    if settings.llm_base_url:
+        merged = f"<system>\n{system}\n</system>\n\n{user}"
+        create_kwargs: dict = dict(
+            model=settings.llm_model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": merged}],
+            temperature=temperature,
+        )
+    else:
+        create_kwargs = dict(
+            model=settings.llm_model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            temperature=temperature,
+        )
+
+    msg = await client.messages.create(**create_kwargs)
     bloque = next((b for b in msg.content if hasattr(b, "text")), None)
     return bloque.text.strip() if bloque else ""
 
@@ -52,9 +66,9 @@ async def _completar_openai(
 ) -> str:
     kwargs: dict = {"api_key": settings.openai_api_key}
     if settings.llm_base_url:
-        kwargs["base_url"] = settings.llm_base_url
+        kwargs["base_url"] = settings.llm_base_url + "/v1"
 
-    client = openai_sdk.AsyncOpenAI(**kwargs)
+    client = openai_sdk.AsyncOpenAI(**kwargs, timeout=90.0)
     resp = await client.chat.completions.create(
         model=settings.llm_model,
         max_tokens=max_tokens,
@@ -64,4 +78,14 @@ async def _completar_openai(
         ],
         temperature=temperature,
     )
-    return resp.choices[0].message.content.strip()
+    choice = resp.choices[0]
+    content = choice.message.content
+    if not content:
+        # Modelos reasoning (kimi, deepseek) agotan tokens en chain-of-thought
+        # sin llegar a la respuesta — subir max_tokens o acortar el documento
+        finish = choice.finish_reason
+        raise RuntimeError(
+            f"El modelo devolvió respuesta vacía (finish_reason={finish}). "
+            "El documento puede ser demasiado largo para el límite de tokens."
+        )
+    return content.strip()
