@@ -5,6 +5,7 @@ WORKDIR /app
 # Dependencias del sistema
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libmupdf-dev \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

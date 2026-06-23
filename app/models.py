@@ -18,6 +18,8 @@ class Documento(Base):
     tipo_documento    = Column(String(50), nullable=False)
     estado_extraccion = Column(String(20), nullable=False, default="pendiente")
     texto_extraido    = Column(JSONB, nullable=True)
+    entidades         = Column(JSONB, nullable=False, server_default="'[]'::jsonb")
+    texto_anonimizado = Column(Text, nullable=True)
     created_at        = Column(DateTime, nullable=True)
     updated_at        = Column(DateTime, nullable=True)
 

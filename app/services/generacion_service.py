@@ -125,7 +125,7 @@ DERECHO SUSTANTIVO — derechos y obligaciones aplicables al caso:
 DERECHO PROCESAL — requisitos formales del documento, plazos y procedimiento:
 ═══════════════════════════════════════════════════════════════════
 {articulos_procesales}
-{bloque_jurisprudencia}
+{bloque_jurisprudencia}{bloque_docs_expediente}
 Genera el memorial completo en HTML."""
 
 
@@ -139,9 +139,16 @@ class Validacion(BaseModel):
     severidad: Literal["info", "warning"]
 
 
+class DocExpediente(BaseModel):
+    nombre: str
+    tipo: str
+    texto_anonimizado: str
+
+
 class GeneracionRequest(BaseModel):
     analisis: AnalisisCaso
     recuperacion: RecuperacionResult
+    docs_expediente: list[DocExpediente] = []
 
 
 class GeneracionResult(BaseModel):
@@ -219,6 +226,27 @@ def _bloque_molde(recuperacion: RecuperacionResult) -> str:
         "MOLDE DE REFERENCIA (solo para estructura, tono y forma):\n"
         "═══════════════════════════════════════════════════════════════════\n"
         f"{recuperacion.molde.contenido}\n"
+    )
+
+
+def _bloque_docs_expediente(docs: list) -> str:
+    if not docs:
+        return ""
+    bloques = []
+    for i, doc in enumerate(docs, 1):
+        bloques.append(
+            f"[Documento {i}: {doc.nombre} — {doc.tipo}]\n{doc.texto_anonimizado}"
+        )
+    return (
+        "\n═══════════════════════════════════════════════════════════════════\n"
+        "DOCUMENTOS DEL EXPEDIENTE (anonimizados — solo para contexto fáctico):\n"
+        "IMPORTANTE: Los identificadores [PERSONA_N], [CI_N], [TEL_N], etc. son\n"
+        "seudónimos locales de cada documento — NO tienen mapeo fijo a las partes\n"
+        "del bloque PARTES. NO intentes deducir qué [PERSONA_N] es quién.\n"
+        "Usa estos documentos ÚNICAMENTE para extraer hechos, fechas y montos.\n"
+        "Para los nombres reales de las partes usa EXCLUSIVAMENTE el bloque PARTES.\n"
+        "═══════════════════════════════════════════════════════════════════\n"
+        + "\n\n".join(bloques) + "\n"
     )
 
 
@@ -328,6 +356,7 @@ async def generar(req: GeneracionRequest) -> GeneracionResult:
         articulos_sustantivos=_formatear_articulos(recuperacion),
         articulos_procesales=_formatear_articulos_procesales(recuperacion),
         bloque_jurisprudencia=_bloque_jurisprudencia(recuperacion),
+        bloque_docs_expediente=_bloque_docs_expediente(req.docs_expediente),
     )
 
     # Llamada al LLM — reintento si el output está vacío o no es HTML válido
