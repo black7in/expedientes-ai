@@ -14,9 +14,13 @@ build/
 
 # Modelos NLP (pesados, no van al repo)
 models/
+modelo_ner/
 *.bin
 *.pt
 *.safetensors
+
+# Recursos generados
+recursos/memoriales/
 
 # Uploads temporales
 uploads/
