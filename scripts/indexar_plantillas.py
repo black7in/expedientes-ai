@@ -27,19 +27,15 @@ from pathlib import Path
 import asyncpg
 import mammoth
 import fitz
-import anthropic
 import openai as openai_sdk
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 
 # ── Configuración ─────────────────────────────────────────────────────────────
 
-DATABASE_URL      = os.getenv("DATABASE_URL", "postgresql://laravel:secret@postgres:5432/expedientes_juridicos")
-LLM_PROVIDER      = os.getenv("LLM_PROVIDER", "anthropic")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-LLM_BASE_URL      = os.getenv("LLM_BASE_URL", "")
-LLM_MODEL         = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
+DATABASE_URL   = os.getenv("DATABASE_URL", "postgresql://laravel:secret@postgres:5432/expedientes_juridicos")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL      = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TRANSFORMERS_CACHE= os.getenv("TRANSFORMERS_CACHE", "/app/.cache/huggingface")
 MODEL_NAME        = "intfloat/multilingual-e5-large"
 ORIGEN            = "caso_real"
@@ -152,6 +148,7 @@ DOCUMENTO:
 
 
 async def llamar_llm(html: str) -> dict:
+    client = openai_sdk.AsyncOpenAI(api_key=OPENAI_API_KEY)
     prompt = _build_prompt(html)
     respuesta_anterior = ""
     ultimo_error = ""
@@ -163,36 +160,16 @@ async def llamar_llm(html: str) -> dict:
             "Devuelve SOLO el JSON válido, sin markdown."
         )
 
-        if LLM_PROVIDER == "openai":
-            kwargs = {"api_key": OPENAI_API_KEY}
-            if LLM_BASE_URL:
-                kwargs["base_url"] = LLM_BASE_URL
-            client = openai_sdk.AsyncOpenAI(**kwargs)
-            resp = await client.chat.completions.create(
-                model=LLM_MODEL,
-                max_tokens=8192,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.1,
-            )
-            raw = resp.choices[0].message.content.strip()
-        else:
-            kwargs = {"api_key": ANTHROPIC_API_KEY}
-            if LLM_BASE_URL:
-                kwargs["base_url"] = LLM_BASE_URL
-            client = anthropic.AsyncAnthropic(**kwargs)
-            msg = await client.messages.create(
-                model=LLM_MODEL,
-                max_tokens=8192,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_msg}],
-                temperature=0.1,
-            )
-            bloque = next((b for b in msg.content if hasattr(b, "text")), None)
-            raw = bloque.text.strip() if bloque else ""
-
+        resp = await client.chat.completions.create(
+            model=LLM_MODEL,
+            max_tokens=8192,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.1,
+        )
+        raw = resp.choices[0].message.content.strip()
         respuesta_anterior = raw
         try:
             return _extraer_json(raw)
@@ -318,7 +295,7 @@ async def main():
     print(f"\n=== INDEXADOR MASIVO DE PLANTILLAS ===")
     print(f"Carpeta : {carpeta}")
     print(f"Archivos: {len(archivos)}")
-    print(f"Provider: {LLM_PROVIDER} / {LLM_MODEL}\n")
+    print(f"Modelo  : {LLM_MODEL}\n")
 
     print("Cargando modelo de embeddings...")
     modelo = SentenceTransformer(MODEL_NAME, cache_folder=TRANSFORMERS_CACHE)
