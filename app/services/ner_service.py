@@ -20,7 +20,7 @@ _BERT_LABEL_MAP = {
 
 ROLES_PER = {"DEMANDANTE", "DEMANDADO", "ABOGADO", "JUEZ", "TESTIGO", "NOTARIO"}
 
-_MODELO_PATH = Path(os.getenv("NER_MODEL_PATH", "modelo_ner"))
+_MODELO_PATH = os.getenv("NER_MODEL_PATH", "modelo_ner")
 
 _SOLO_REGEX = {"CI", "NIT"}  # BERT produce ruido en estos tipos — solo regex
 
