@@ -22,11 +22,17 @@ ROLES_PER = {"DEMANDANTE", "DEMANDADO", "ABOGADO", "JUEZ", "TESTIGO", "NOTARIO"}
 
 _MODELO_PATH = Path(os.getenv("NER_MODEL_PATH", "modelo_ner"))
 
+_SOLO_REGEX = {"CI", "NIT"}  # BERT produce ruido en estos tipos — solo regex
+
+_CI_NUMERO = re.compile(r"3\d{7}|[1-9]\d{6}")  # 8 dígitos iniciando en 3, o 7 dígitos
+
 _PATRONES: dict[str, re.Pattern] = {
     "CI": re.compile(
-        r"C(?:édula(?:\s+de\s+Identidad)?|\.?\s*I\.?)"
-        r"(?:\s+N(?:ro?|°|úm(?:ero)?)\.?)?\s*[:\-]?\s*\d{6,8}"
-        r"(?:\s+(?:Cbba?\.?|L\.?P\.?|S\.?C\.?|Or\.?|Pt\.?|Be\.?|Pan\.?|Tj\.?|Sb\.?))?",
+        r"(?:C(?:é|e)dula(?:\s+de\s+Identidad)?\.?|C\.?\s*I\.?)"
+        r"(?:\s*[:\-])?\s*"
+        r"(?:N[rRoº°]?\.?\s*)?"
+        r"(?:3\d{7}|[1-9]\d{6})\b"
+        r"(?:\s*(?:Cbba?\.?|L\.?P\.?|S\.?C\.?|Or\.?|Pt\.?|Be\.?|Pan\.?|Tj\.?|Sb\.?))?",
         re.IGNORECASE,
     ),
     "NIT": re.compile(
@@ -110,7 +116,7 @@ class NerService:
         for chunk, offset in self._chunkar(texto):
             for ent in self._pipeline(chunk):
                 tipo = _BERT_LABEL_MAP.get(ent["entity_group"].upper())
-                if tipo is None:
+                if tipo is None or tipo in _SOLO_REGEX:
                     continue
                 inicio = ent["start"] + offset
                 fin    = ent["end"]   + offset
