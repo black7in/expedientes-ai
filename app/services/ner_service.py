@@ -109,6 +109,18 @@ class NerService:
 
     # ── BERT ──────────────────────────────────────────────────────────────────
 
+    _SEP = set(' \n\t\r.,;:()[]{}"\'-/\\«»')
+
+    def _expandir_span(self, texto: str, inicio: int, fin: int) -> tuple[int, int]:
+        """Extiende el span al límite de palabra completa para evitar cortes de subword."""
+        while inicio > 0 and texto[inicio - 1] not in self._SEP:
+            inicio -= 1
+        while fin < len(texto) and texto[fin] not in self._SEP:
+            fin += 1
+        while inicio < fin and texto[inicio] in self._SEP:
+            inicio += 1
+        return inicio, fin
+
     def _ner_bert(self, texto: str) -> list[dict]:
         result: list[dict] = []
         vistos: set[tuple[int, int]] = set()
@@ -120,11 +132,15 @@ class NerService:
                     continue
                 inicio = ent["start"] + offset
                 fin    = ent["end"]   + offset
+                inicio, fin = self._expandir_span(texto, inicio, fin)
+                texto_ent = texto[inicio:fin].strip()
+                if len(texto_ent) < 3:
+                    continue
                 if (inicio, fin) in vistos:
                     continue
                 vistos.add((inicio, fin))
                 result.append({
-                    "texto":  ent["word"],
+                    "texto":  texto_ent,
                     "tipo":   tipo,
                     "inicio": inicio,
                     "fin":    fin,
