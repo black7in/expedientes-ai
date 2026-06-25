@@ -48,6 +48,9 @@ class EntidadPatch(BaseModel):
     confirmado: bool | None = None
     eliminar:   bool = False
     rol:        str | None = None
+    inicio:     int | None = None
+    fin:        int | None = None
+    texto:      str | None = None
 
 
 @router.patch("/{documento_id}/entidades/{entidad_id}")
@@ -80,6 +83,13 @@ async def actualizar_entidad(
         if body.rol is not None and entidades[idx].get("tipo") == "PER":
             entidades[idx]["rol"] = body.rol if body.rol in ROLES_PER else None
             entidades[idx]["confirmado"] = True
+        if body.inicio is not None and body.fin is not None and body.texto is not None:
+            texto_doc = (doc.texto_extraido or {}).get("texto_completo", "")
+            if 0 <= body.inicio < body.fin <= len(texto_doc):
+                entidades[idx]["inicio"] = body.inicio
+                entidades[idx]["fin"]    = body.fin
+                entidades[idx]["texto"]  = body.texto
+                entidades[idx]["confirmado"] = True
 
     texto = (doc.texto_extraido or {}).get("texto_completo", "")
     doc.entidades         = ner_service.recompute_placeholders(entidades)
